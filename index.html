@@ -15,6 +15,7 @@
             <nav id="tabs">
                 <button class="tab-btn active" data-tab="dashboard">Dashboard</button>
                 <button class="tab-btn" data-tab="transactions">Transações</button>
+                <button class="tab-btn" data-tab="boletos">Boletos</button>
                 <button class="tab-btn" data-tab="recurring">Recorrências</button>
                 <button class="tab-btn" data-tab="cards">Cartões</button>
                 <button class="tab-btn" data-tab="settings">Config</button>
@@ -53,6 +54,25 @@
                 </div>
                 <div id="transaction-list">
                     <!-- Transactions will be rendered here -->
+                </div>
+            </section>
+
+            <!-- Boletos Section -->
+            <section id="boletos" class="tab-content">
+                <div class="section-header">
+                    <h2>Boletos / Contas a Pagar</h2>
+                    <div class="filters">
+                        <select id="filter-boletos-status">
+                            <option value="Pendente">Pendente</option>
+                            <option value="Pago">Pago</option>
+                            <option value="Todos">Todos</option>
+                        </select>
+                        <button class="btn-primary" onclick="openBoletoModal()">+ Novo</button>
+                        <button class="btn-secondary" onclick="openBoletoInstallmentModal()">+ Parcelamento</button>
+                    </div>
+                </div>
+                <div id="boletos-list">
+                    <p class="loading">Carregando boletos...</p>
                 </div>
             </section>
 

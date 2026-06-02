@@ -81,6 +81,21 @@ function formatCurrency(val) {
 }
 
 /**
+ * Helper to parse Grist dates (which come as Unix timestamps in seconds)
+ */
+function parseDate(val) {
+    if (!val) return new Date();
+    // Grist Date columns return Unix timestamps in seconds. 
+    // JS Date expects milliseconds.
+    if (typeof val === 'number') {
+        // If it's a timestamp like 1779926400, it's seconds.
+        // If it was already ms, it would be much larger (13 digits).
+        return new Date(val > 10000000000 ? val : val * 1000);
+    }
+    return new Date(val);
+}
+
+/**
  * Main logic for rendering all tabs
  */
 function calculateAndRender() {
@@ -90,6 +105,7 @@ function calculateAndRender() {
     
     renderPrediction(totalBalance);
     renderTransactions();
+    renderBoletos();
     renderRecurring();
     renderCardsAndInstallments();
     renderSettings();
@@ -97,6 +113,12 @@ function calculateAndRender() {
     if (selectedItemId && document.getElementById('recurring-modal').style.display === 'block') {
         renderRules(selectedItemId);
     }
+}
+
+// Add filter listener for boletos
+const boletosFilter = document.getElementById('filter-boletos-status');
+if (boletosFilter) {
+    boletosFilter.addEventListener('change', renderBoletos);
 }
 
 // --- RENDERERS ---
@@ -111,7 +133,9 @@ function renderPrediction(startingBalance) {
     const monthsNames = ['Janeiro', 'Fevereiro', 'Março', 'Abril', 'Maio', 'Junho', 'Julho', 'Agosto', 'Setembro', 'Outubro', 'Novembro', 'Dezembro'];
     const timeline = [];
     
-    for (let i = 0; i < 6; i++) {
+    // We start from -1 to capture credit card expenses from the previous month 
+    // that will impact the balance in the current month.
+    for (let i = -1; i < 6; i++) {
         const targetDate = new Date(state.currentYear, state.currentMonth - 1 + i, 1);
         const m = targetDate.getMonth() + 1;
         const y = targetDate.getFullYear();
@@ -120,67 +144,231 @@ function renderPrediction(startingBalance) {
 
         state.recorrencias.filter(r => r.Ativo).forEach(recorrencia => {
             const activeRule = state.recorrenciasRegras
-                .filter(regra => regra.RecorrenciaId === recorrencia.id)
+                .filter(regra => Number(regra.RecorrenciaId) === Number(recorrencia.id))
                 .filter(regra => (regra.AnoInicio < y) || (regra.AnoInicio === y && regra.MesInicio <= m))
                 .sort((a, b) => (a.AnoInicio !== b.AnoInicio ? b.AnoInicio - a.AnoInicio : b.MesInicio - a.MesInicio))[0];
 
             if (activeRule) {
-                const event = { descricao: recorrencia.Nome, valor: recorrencia.Tipo === 'Entrada' ? activeRule.Valor : -activeRule.Valor, dia: activeRule.DiaVencimento, cartaoId: activeRule.CartaoId };
+                const event = { 
+                    descricao: recorrencia.Nome, 
+                    valor: recorrencia.Tipo === 'Entrada' ? activeRule.Valor : -activeRule.Valor, 
+                    dia: activeRule.DiaVencimento, 
+                    cartaoId: activeRule.CartaoId 
+                };
+                
                 if (event.cartaoId) {
-                    const card = state.cartoes.find(c => c.id === event.cartaoId);
+                    const card = state.cartoes.find(c => Number(c.id) === Number(event.cartaoId));
                     if (card) {
-                        let iM = m; let iY = y;
-                        if (event.dia > card.DiaFechamento) iM++;
-                        iM++; if (iM > 12) { iM -= 12; iY++; }
-                        timeline.push({ ...event, dia: card.DiaVencimento, targetMonth: iM, targetYear: iY, shifted: true });
+                        let billM = m; 
+                        let billY = y;
+                        // If expense day is after closing, it goes to next month's bill
+                        if (event.dia > card.DiaFechamento) {
+                            billM++;
+                            if (billM > 12) { billM = 1; billY++; }
+                        }
+                        // The bill is paid in the month after the bill reference (standard card logic)
+                        let payM = billM + 1;
+                        let payY = billY;
+                        if (payM > 12) { payM = 1; payY++; }
+                        
+                        timeline.push({ ...event, dia: card.DiaVencimento, targetMonth: payM, targetYear: payY, shifted: true });
                     }
-                } else { monthEvents.push(event); }
+                } else if (i >= 0) { 
+                    // Direct account expenses only appear in the month they occur
+                    monthEvents.push(event); 
+                }
             }
         });
 
         state.boletos.filter(b => !b.Pago).forEach(b => {
-            const bDate = new Date(b.DataVencimento);
-            if (bDate.getMonth() + 1 === m && bDate.getFullYear() === y) monthEvents.push({ descricao: b.Descricao, valor: -b.Valor, dia: bDate.getDate() });
-        });
-
-        state.parcelamentos.forEach(parc => {
-            const card = state.cartoes.find(c => c.id === parc.CartaoId);
-            if (!card) return;
-            const pDate = new Date(parc.DataCompra);
-            const mDiff = (y - pDate.getFullYear()) * 12 + (m - (pDate.getMonth() + 1));
-            if (mDiff >= 0 && mDiff < parc.NumeroParcelas) {
-                let iM = m; let iY = y;
-                if (pDate.getDate() > card.DiaFechamento) iM++;
-                iM++; if (iM > 12) { iM -= 12; iY++; }
-                timeline.push({ descricao: `${parc.Descricao} (${mDiff + 1}/${parc.NumeroParcelas})`, valor: -(parc.ValorTotal / parc.NumeroParcelas), dia: card.DiaVencimento, targetMonth: iM, targetYear: iY, shifted: true });
+            const bDate = parseDate(b.DataVencimento);
+            if (bDate.getMonth() + 1 === m && bDate.getFullYear() === y && i >= 0) {
+                monthEvents.push({ descricao: b.Descricao, valor: -b.Valor, dia: bDate.getDate() });
             }
         });
 
-        const incoming = timeline.filter(e => e.targetMonth === m && e.targetYear === y && e.shifted);
-        const finalEvents = [...monthEvents, ...incoming].sort((a, b) => a.dia - b.dia);
-        const impact = finalEvents.reduce((acc, e) => acc + (e.valor || 0), 0);
-        runningBalance += impact;
+        state.parcelamentos.forEach(parc => {
+            const card = state.cartoes.find(c => Number(c.id) === Number(parc.CartaoId));
+            if (!card) return;
+            const pDate = parseDate(parc.DataCompra);
+            const mDiff = (y - pDate.getFullYear()) * 12 + (m - (pDate.getMonth() + 1));
+            
+            if (mDiff >= 0 && mDiff < parc.NumeroParcelas) {
+                let billM = m;
+                let billY = y;
+                if (pDate.getDate() > card.DiaFechamento) {
+                    billM++;
+                    if (billM > 12) { billM = 1; billY++; }
+                }
+                let payM = billM + 1;
+                let payY = billY;
+                if (payM > 12) { payM = 1; payY++; }
 
-        state.predictionDetails.push({ monthName: `${monthsNames[monthIdx]} ${y}`, events: finalEvents, totalIn: finalEvents.filter(e => e.valor > 0).reduce((acc, e) => acc + e.valor, 0), totalOut: finalEvents.filter(e => e.valor < 0).reduce((acc, e) => acc + Math.abs(e.valor), 0), balance: runningBalance });
+                timeline.push({ 
+                    descricao: `${parc.Descricao} (${mDiff + 1}/${parc.NumeroParcelas})`, 
+                    valor: -(parc.ValorTotal / parc.NumeroParcelas), 
+                    dia: card.DiaVencimento, 
+                    targetMonth: payM, 
+                    targetYear: payY, 
+                    shifted: true 
+                });
+            }
+        });
 
-        const row = document.createElement('div');
-        row.className = 'month-row clickable-row';
-        row.onclick = () => openMonthModal(i);
-        row.innerHTML = `<span>${monthsNames[monthIdx]} ${y}</span><span class="month-balance ${runningBalance >= 0 ? 'positive' : 'negative'}">${formatCurrency(runningBalance)}</span>`;
-        listEl.appendChild(row);
+        // Only render and calculate balance for current and future months
+        if (i >= 0) {
+            const incoming = timeline.filter(e => e.targetMonth === m && e.targetYear === y && e.shifted);
+            const finalEvents = [...monthEvents, ...incoming].sort((a, b) => a.dia - b.dia);
+            const impact = finalEvents.reduce((acc, e) => acc + (e.valor || 0), 0);
+            runningBalance += impact;
+
+            state.predictionDetails.push({ 
+                monthName: `${monthsNames[monthIdx]} ${y}`, 
+                events: finalEvents, 
+                totalIn: finalEvents.filter(e => e.valor > 0).reduce((acc, e) => acc + e.valor, 0), 
+                totalOut: finalEvents.filter(e => e.valor < 0).reduce((acc, e) => acc + Math.abs(e.valor), 0), 
+                balance: runningBalance 
+            });
+
+            const row = document.createElement('div');
+            row.className = 'month-row clickable-row';
+            const detailIndex = state.predictionDetails.length - 1;
+            row.onclick = () => openMonthModal(detailIndex);
+            row.innerHTML = `<span>${monthsNames[monthIdx]} ${y}</span><span class="month-balance ${runningBalance >= 0 ? 'positive' : 'negative'}">${formatCurrency(runningBalance)}</span>`;
+            listEl.appendChild(row);
+        }
     }
 }
 
 function renderTransactions() {
     const listEl = document.getElementById('transaction-list');
     if (!listEl) return;
-    const sorted = [...state.transacoes].sort((a, b) => new Date(b.Data) - new Date(a.Data)).slice(0, 50);
+    const sorted = [...state.transacoes].sort((a, b) => parseDate(b.Data) - parseDate(a.Data)).slice(0, 50);
     listEl.innerHTML = sorted.map(t => {
         const cat = state.categorias.find(c => c.id === t.CategoriaId);
         const conta = state.contas.find(c => c.id === t.ContaId);
-        return `<div class="month-row clickable-row" onclick="openTransactionModal(${t.id})"><div style="display:flex;flex-direction:column;"><span style="font-weight:bold;">${t.Descricao}</span><small>${new Date(t.Data).toLocaleDateString('pt-BR')} | ${cat ? cat.Nome : '-'} | ${conta ? conta.Nome : '-'}</small></div><span class="${t.Tipo === 'Entrada' ? 'positive' : 'negative'}">${formatCurrency(t.Valor)}</span></div>`
+        return `<div class="month-row clickable-row" onclick="openTransactionModal(${t.id})"><div style="display:flex;flex-direction:column;"><span style="font-weight:bold;">${t.Descricao}</span><small>${parseDate(t.Data).toLocaleDateString('pt-BR')} | ${cat ? cat.Nome : '-'} | ${conta ? conta.Nome : '-'}</small></div><span class="${t.Tipo === 'Entrada' ? 'positive' : 'negative'}">${formatCurrency(t.Valor)}</span></div>`
     }).join('') || '<p>Nenhuma transação encontrada.</p>';
 }
+
+function renderBoletos() {
+    const listEl = document.getElementById('boletos-list');
+    if (!listEl) return;
+    const filter = document.getElementById('filter-boletos-status')?.value || 'Pendente';
+    
+    let filtered = state.boletos;
+    if (filter === 'Pendente') filtered = state.boletos.filter(b => !b.Pago);
+    else if (filter === 'Pago') filtered = state.boletos.filter(b => b.Pago);
+    
+    const sorted = [...filtered].sort((a, b) => parseDate(a.DataVencimento) - parseDate(b.DataVencimento));
+    
+    listEl.innerHTML = sorted.map(b => {
+        // According to SCHEMA.md, Boletos table does NOT have CategoriaId or ContaId
+        return `<div class="month-row">
+            <div style="display:flex;flex-direction:column;flex:1;" class="clickable-row" onclick="openBoletoModal(${b.id})">
+                <span style="font-weight:bold;">${b.Descricao}</span>
+                <small>${parseDate(b.DataVencimento).toLocaleDateString('pt-BR')} | Status: ${b.Status || '-'}</small>
+            </div>
+            <div style="display:flex;align-items:center;gap:10px;">
+                <span class="negative" style="font-weight:bold;">${formatCurrency(b.Valor)}</span>
+                ${!b.Pago ? `<button class="btn-primary" style="padding:0.2rem 0.5rem;font-size:0.8rem;" onclick="payBoleto(${b.id})">Pagar</button>` : '<span>✅</span>'}
+            </div>
+        </div>`;
+    }).join('') || '<p>Nenhum boleto encontrado.</p>';
+}
+
+window.payBoleto = async function(id) {
+    const b = state.boletos.find(x => x.id === id);
+    if (!b) return;
+    
+    // As Boletos don't have ContaId, we ask or use a default one
+    const defaultAccount = state.contas[0];
+    if (!defaultAccount) return alert('Nenhuma conta bancária encontrada para processar o pagamento.');
+
+    if (!confirm(`Confirmar pagamento de ${b.Descricao} (${formatCurrency(b.Valor)}) usando a conta ${defaultAccount.Nome}?`)) return;
+
+    updateStatus('Processando pagamento...');
+    try {
+        const transactionData = {
+            Descricao: `PAGTO: ${b.Descricao}`,
+            Valor: b.Valor,
+            Data: new Date().toISOString().split('T')[0],
+            ContaId: defaultAccount.id,
+            Tipo: 'Saída',
+            Status: 'Confirmado',
+            BoletoId: b.id
+        };
+
+        const actions = [
+            ['UpdateRecord', 'Boletos', id, { Pago: true }],
+            ['AddRecord', 'Transacoes', null, transactionData]
+        ];
+        await grist.docApi.applyUserActions(actions);
+        await fetchData();
+    } catch (e) { alert('Erro ao pagar: ' + e.message); }
+};
+
+window.openBoletoModal = function(id) {
+    const b = id ? state.boletos.find(x => x.id === id) : { Descricao: '', Valor: 0, DataVencimento: new Date().toISOString().split('T')[0], Pago: false, LembreteDias: 5 };
+    const body = `<div class="modal-body-form">
+        <div class="form-group"><label>Descrição</label><input type="text" id="b-desc" value="${b.Descricao}"></div>
+        <div class="form-row">
+            <div class="form-group" style="flex:1;"><label>Valor</label><input type="number" id="b-val" value="${b.Valor}"></div>
+            <div class="form-group" style="flex:1;"><label>Vencimento</label><input type="date" id="b-venc" value="${parseDate(b.DataVencimento).toISOString().split('T')[0]}"></div>
+        </div>
+        <div class="form-row">
+            <div class="form-group" style="flex:1;"><label>Lembrete (Dias)</label><input type="number" id="b-lembrete" value="${b.LembreteDias || 0}"></div>
+            <div class="form-group" style="flex:1;"><label>Link PDF</label><input type="text" id="b-link" value="${b.LinkPdf || ''}"></div>
+        </div>
+        <div class="form-group"><label>Pago</label><input type="checkbox" id="b-pago" ${b.Pago ? 'checked' : ''}></div>
+    </div>`;
+    openGenericModal(id ? 'Editar Boleto' : 'Novo Boleto', body, async () => {
+        await saveToGrist('Boletos', id, {
+            Descricao: document.getElementById('b-desc').value,
+            Valor: parseFloat(document.getElementById('b-val').value),
+            DataVencimento: document.getElementById('b-venc').value,
+            LembreteDias: parseInt(document.getElementById('b-lembrete').value),
+            LinkPdf: document.getElementById('b-link').value,
+            Pago: document.getElementById('b-pago').checked
+        });
+    });
+};
+
+window.openBoletoInstallmentModal = function() {
+    const body = `<div class="modal-body-form">
+        <div class="form-group"><label>Descrição Base</label><input type="text" id="bi-desc" placeholder="Ex: DARF IR"></div>
+        <div class="form-row">
+            <div class="form-group" style="flex:1;"><label>Valor da Parcela</label><input type="number" id="bi-val" placeholder="800"></div>
+            <div class="form-group" style="flex:1;"><label>Qtd Parcelas</label><input type="number" id="bi-num" value="10"></div>
+        </div>
+        <div class="form-group"><label>Vencimento 1ª Parcela</label><input type="date" id="bi-data" value="${new Date().toISOString().split('T')[0]}"></div>
+    </div>`;
+    openGenericModal('Gerar Parcelamento de Boletos', body, async () => {
+        const desc = document.getElementById('bi-desc').value;
+        const val = parseFloat(document.getElementById('bi-val').value);
+        const num = parseInt(document.getElementById('bi-num').value);
+        const dateStr = document.getElementById('bi-data').value;
+        
+        if (!desc || isNaN(val) || isNaN(num) || !dateStr) return alert('Preencha todos os campos.');
+        
+        updateStatus('Gerando parcelas...');
+        const actions = [];
+        let [year, month, day] = dateStr.split('-').map(Number);
+        
+        for (let i = 0; i < num; i++) {
+            const d = new Date(year, month - 1 + i, day);
+            actions.push(['AddRecord', 'Boletos', null, {
+                Descricao: `${desc} (${i + 1}/${num})`,
+                Valor: val,
+                DataVencimento: d.toISOString().split('T')[0],
+                Pago: false,
+                LembreteDias: 5
+            }]);
+        }
+        await grist.docApi.applyUserActions(actions);
+        await fetchData();
+    });
+};
 
 function renderRecurring() {
     const listEl = document.getElementById('recurring-list');
