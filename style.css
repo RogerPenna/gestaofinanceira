@@ -264,6 +264,20 @@ button:hover {
 .btn-secondary { background-color: var(--secondary-color); color: white; }
 .btn-danger-small { background-color: var(--danger-color); color: white; padding: 0.3rem 0.6rem; font-size: 0.8rem; }
 
+.granularity-btn {
+    padding: 0.3rem 0.8rem;
+    font-size: 0.8rem;
+    background-color: #f1f5f9;
+    color: #64748b;
+    border: 1px solid #e2e8f0;
+}
+
+.granularity-btn.active {
+    background-color: var(--secondary-color);
+    color: white;
+    border-color: var(--secondary-color);
+}
+
 hr {
     border: 0;
     border-top: 1px solid var(--border-color);
@@ -296,6 +310,36 @@ hr {
 
 .clickable-row:hover {
     background-color: #f9f9f9;
+}
+
+/* Transaction Styles */
+.trans-pending-recorrencia {
+    background-color: #3b82f6 !important; /* Azul */
+    color: white !important;
+}
+
+.trans-pending-recorrencia small {
+    color: #e0f2fe !important;
+}
+
+.trans-pending-recorrencia .positive,
+.trans-pending-recorrencia .negative {
+    color: white !important;
+}
+
+.trans-confirmed-recorrencia {
+    background-color: white !important;
+    color: #3b82f6 !important; /* Texto Azul */
+    border: 1px solid #3b82f6;
+}
+
+.trans-confirmed-recorrencia small {
+    color: #60a5fa !important;
+}
+
+.trans-confirmed-recorrencia .positive,
+.trans-confirmed-recorrencia .negative {
+    color: #3b82f6 !important;
 }
 
 /* Month Detail Styles */

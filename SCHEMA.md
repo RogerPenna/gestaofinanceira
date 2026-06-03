@@ -18,17 +18,23 @@
 - **ContaId**: Reference (Contas)
 - **LimiteDisponivel**: Formula (Numeric)
 
+## GrupoCategorias
+- **Nome**: Text
+
 ## Categorias
 - **Nome**: Text
 - **TipoPadrao**: Choice (Entrada/Saída)
+- **GrupoRef**: Reference (GrupoCategorias)
 
 ## Contas
 - **Nome**: Text
 - **Tipo**: Choice
 - **SaldoInicial**: Numeric
+- **DataSaldoInicial**: Date
 - **Cor**: Text
 - **Ativa**: Bool
 - **SaldoAtual**: Formula (Numeric)
+
 
 ## Parcelamentos
 - **Descricao**: Text

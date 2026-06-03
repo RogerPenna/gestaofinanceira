@@ -5,8 +5,8 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Gestão Financeira Pessoal</title>
     <link rel="stylesheet" href="style.css">
-    <!-- Grist Plugin API -->
     <script src="https://docs.getgrist.com/grist-plugin-api.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 </head>
 <body>
     <div id="app">
@@ -31,6 +31,21 @@
                         <p id="total-balance">R$ 0,00</p>
                     </div>
                 </div>
+
+                <div class="chart-section card" style="margin-bottom: 2rem;">
+                    <div class="section-header" style="margin-bottom: 1rem;">
+                        <h2>Fluxo de Caixa Projetado</h2>
+                        <div class="filters">
+                            <button class="btn-secondary granularity-btn active" data-gran="daily">Diário</button>
+                            <button class="btn-secondary granularity-btn" data-gran="weekly">Semanal</button>
+                            <button class="btn-secondary granularity-btn" data-gran="monthly">Mensal</button>
+                        </div>
+                    </div>
+                    <div style="height: 300px; position: relative;">
+                        <canvas id="cashflow-chart"></canvas>
+                    </div>
+                </div>
+
                 <div class="prediction-container">
                     <h2>Previsão de 6 Meses</h2>
                     <div id="prediction-list">
@@ -76,7 +91,7 @@
                 </div>
             </section>
 
-            <!-- Recurring Section (Already expanded) -->
+            <!-- Recurring Section -->
             <section id="recurring" class="tab-content">
                 <div class="section-header">
                     <h2>Itens Recorrentes</h2>
@@ -86,8 +101,8 @@
                             <option value="Entrada">Entrada</option>
                             <option value="Saída">Saída</option>
                         </select>
-                        <select id="filter-recurring-category">
-                            <option value="">Categoria (Todas)</option>
+                        <select id="filter-recurring-group">
+                            <option value="">Grupo (Todos)</option>
                         </select>
                         <button class="btn-primary" onclick="openRecurringModal(null)">+ Novo</button>
                     </div>
@@ -108,7 +123,7 @@
                 </div>
             </section>
 
-            <!-- Settings Section (Accounts & Categories) -->
+            <!-- Settings Section -->
             <section id="settings" class="tab-content">
                 <div class="settings-grid">
                     <div class="settings-column">
@@ -117,6 +132,13 @@
                             <button class="btn-secondary" style="padding: 0.3rem 0.6rem;" onclick="openAccountModal()">+</button>
                         </div>
                         <div id="accounts-list"></div>
+                    </div>
+                    <div class="settings-column">
+                        <div class="section-header">
+                            <h3>Grupos</h3>
+                            <button class="btn-secondary" style="padding: 0.3rem 0.6rem;" onclick="openGroupModal()">+</button>
+                        </div>
+                        <div id="groups-list"></div>
                     </div>
                     <div class="settings-column">
                         <div class="section-header">
@@ -129,14 +151,14 @@
             </section>
         </main>
 
-        <!-- Modals Container (to keep it organized) -->
+        <!-- Modals Container -->
         <div id="modals">
-            <!-- Recurring Item Modal (Updated) -->
+            <!-- Recurring Item Modal -->
             <div id="recurring-modal" class="modal">
                 <div class="modal-content">
                     <span class="close-modal" data-modal="recurring-modal">&times;</span>
                     <h2 id="modal-item-name">Recorrência</h2>
-                    <div class="item-form">
+                    <div class="modal-body-form">
                         <div class="form-group">
                             <label>Nome:</label>
                             <input type="text" id="edit-item-nome">
@@ -149,67 +171,87 @@
                                     <option value="Saída">Saída</option>
                                 </select>
                             </div>
-                            <div class="form-group" style="flex: 1;">
-                                <label>Categoria:</label>
-                                <select id="edit-item-categoria"></select>
+                            <div class="form-group" style="flex: 0.5;">
+                                <label>Ativo:</label>
+                                <input type="checkbox" id="edit-item-ativo" checked>
                             </div>
                         </div>
-                        <div class="form-group">
-                            <label>Ativo:</label>
-                            <input type="checkbox" id="edit-item-ativo">
+                        
+                        <div id="edit-item-category-container">
+                            <!-- Group/Category picker will be rendered here -->
                         </div>
-                        <button id="save-item-btn" class="btn-primary">Salvar Recorrência</button>
+
+                        <button class="btn-primary" id="save-item-btn">Salvar Recorrência</button>
                     </div>
-                    <hr>
-                    <div id="rules-section">
+
+                    <div id="rules-section" style="margin-top: 2rem;">
+                        <hr>
                         <h3>Regras / Timeline</h3>
                         <div id="rules-list"></div>
-                        <div class="add-rule-form">
+                        
+                        <div class="rule-form" style="background: #f8f9fa; padding: 1rem; border-radius: 6px; margin-top: 1rem;">
                             <h4 id="rule-form-title">Nova Regra</h4>
                             <input type="hidden" id="edit-rule-id">
                             <div class="form-row">
-                                <input type="number" id="new-rule-mes" placeholder="Mês" min="1" max="12">
-                                <input type="number" id="new-rule-ano" placeholder="Ano">
+                                <input type="number" id="new-rule-mes" placeholder="Mês (1-12)">
+                                <input type="number" id="new-rule-ano" placeholder="Ano (Ex: 2026)">
                                 <input type="number" id="new-rule-valor" placeholder="Valor">
                                 <input type="number" id="new-rule-dia" placeholder="Dia">
                             </div>
                             <div class="form-row">
-                                <select id="new-rule-conta"><option value="">-- Conta --</option></select>
-                                <select id="new-rule-cartao"><option value="">-- Cartão --</option></select>
+                                <select id="new-rule-conta"></select>
+                                <select id="new-rule-cartao"></select>
                             </div>
-                            <div style="display: flex; gap: 0.5rem;">
-                                <button id="add-rule-btn" class="btn-secondary">Salvar Regra</button>
-                                <button id="cancel-rule-edit-btn" class="btn-danger-small" style="display: none;">Cancelar</button>
+                            <div style="display: flex; gap: 0.5rem; margin-top: 0.5rem;">
+                                <button class="btn-primary" id="add-rule-btn" style="flex: 1;">Salvar Regra</button>
+                                <button class="btn-secondary" id="cancel-rule-edit-btn" style="display: none;">Cancelar</button>
                             </div>
                         </div>
                     </div>
                 </div>
             </div>
 
-            <!-- Month Detail Modal (Dashboard) -->
-            <div id="month-modal" class="modal">
-                <div class="modal-content">
-                    <span class="close-modal" data-modal="month-modal">&times;</span>
-                    <h2 id="modal-month-name">Detalhamento</h2>
-                    <div class="summary-box">
-                        <div class="summary-item"><span class="label">Entradas</span><span id="month-total-in" class="positive"></span></div>
-                        <div class="summary-item"><span class="label">Saídas</span><span id="month-total-out" class="negative"></span></div>
-                        <div class="summary-item"><span class="label">Resultado</span><span id="month-net-result"></span></div>
-                    </div>
-                    <hr>
-                    <h3>Entradas</h3><div id="month-in-list" class="event-list"></div>
-                    <hr>
-                    <h3>Saídas</h3><div id="month-out-list" class="event-list"></div>
-                </div>
-            </div>
-
-            <!-- Unified Generic Modal for simple tables -->
+            <!-- Generic Modal -->
             <div id="generic-modal" class="modal">
                 <div class="modal-content">
                     <span class="close-modal" data-modal="generic-modal">&times;</span>
-                    <h2 id="generic-modal-title">Editar</h2>
+                    <h2 id="generic-modal-title">Título</h2>
                     <div id="generic-modal-body"></div>
-                    <button id="generic-modal-save" class="btn-primary" style="margin-top: 1rem;">Salvar</button>
+                    <div style="margin-top: 1.5rem; text-align: right;">
+                        <button class="btn-primary" id="generic-modal-save">Salvar</button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Month Modal -->
+            <div id="month-modal" class="modal">
+                <div class="modal-content" style="max-width: 800px;">
+                    <span class="close-modal" data-modal="month-modal">&times;</span>
+                    <h2 id="modal-month-name">Detalhamento Mensal</h2>
+                    <div class="summary-box">
+                        <div class="summary-item">
+                            <span class="label">Entradas</span>
+                            <span id="month-total-in" class="positive">R$ 0,00</span>
+                        </div>
+                        <div class="summary-item">
+                            <span class="label">Saídas</span>
+                            <span id="month-total-out" class="negative">R$ 0,00</span>
+                        </div>
+                        <div class="summary-item">
+                            <span class="label">Resultado</span>
+                            <span id="month-net-result">R$ 0,00</span>
+                        </div>
+                    </div>
+                    <div class="month-details-grid" style="display: grid; grid-template-columns: 1fr 1fr; gap: 1rem;">
+                        <div>
+                            <h4>Entradas</h4>
+                            <div id="month-in-list" class="event-list"></div>
+                        </div>
+                        <div>
+                            <h4>Saídas</h4>
+                            <div id="month-out-list" class="event-list"></div>
+                        </div>
+                    </div>
                 </div>
             </div>
         </div>

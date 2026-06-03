@@ -10,6 +10,7 @@ let state = {
     contas: [],
     cartoes: [],
     categorias: [],
+    grupoCategorias: [],
     transacoes: [],
     parcelamentos: [],
     boletos: [],
@@ -17,7 +18,9 @@ let state = {
     recorrenciasRegras: [],
     currentMonth: new Date().getMonth() + 1,
     currentYear: new Date().getFullYear(),
-    predictionDetails: [] 
+    predictionDetails: [],
+    chartGranularity: 'daily',
+    chartInstance: null
 };
 
 let selectedItemId = null;
@@ -27,7 +30,7 @@ const tableLens = new GristTableLens(grist);
 grist.ready({ requiredAccess: 'full' });
 grist.onRecords(async () => { await fetchData(); });
 
-// --- Tab Navigation ---
+// --- Tab Navigation & UI Events ---
 document.querySelectorAll('.tab-btn').forEach(btn => {
     btn.addEventListener('click', () => {
         document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
@@ -37,16 +40,26 @@ document.querySelectorAll('.tab-btn').forEach(btn => {
     });
 });
 
+document.querySelectorAll('.granularity-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+        document.querySelectorAll('.granularity-btn').forEach(b => b.classList.remove('active'));
+        btn.classList.add('active');
+        state.chartGranularity = btn.getAttribute('data-gran');
+        updateChart();
+    });
+});
+
 /**
  * Fetch all necessary tables from Grist using TableLens
  */
 async function fetchData() {
     updateStatus('Sincronizando...');
     try {
-        const [contas, cartoes, categorias, transacoes, parcelamentos, boletos, recorrencias, recorrenciasRegras] = await Promise.all([
+        const [contas, cartoes, categorias, grupoCategorias, transacoes, parcelamentos, boletos, recorrencias, recorrenciasRegras] = await Promise.all([
             tableLens.fetchTableRecords('Contas'),
             tableLens.fetchTableRecords('Cartoes'),
             tableLens.fetchTableRecords('Categorias'),
+            tableLens.fetchTableRecords('GrupoCategorias'),
             tableLens.fetchTableRecords('Transacoes'),
             tableLens.fetchTableRecords('Parcelamentos'),
             tableLens.fetchTableRecords('Boletos'),
@@ -57,17 +70,62 @@ async function fetchData() {
         state.contas = contas;
         state.cartoes = cartoes;
         state.categorias = categorias;
+        state.grupoCategorias = grupoCategorias;
         state.transacoes = transacoes;
         state.parcelamentos = parcelamentos;
         state.boletos = boletos;
         state.recorrencias = recorrencias;
         state.recorrenciasRegras = recorrenciasRegras;
 
+        // Auto-generate recurring transactions for current month if they don't exist
+        await autoGenerateRecurrences();
+
         updateStatus('Sincronizado.');
         calculateAndRender();
     } catch (err) {
         console.error('Erro ao buscar dados:', err);
         updateStatus(`Erro: ${err.message}`);
+    }
+}
+
+async function autoGenerateRecurrences() {
+    const today = new Date();
+    const actions = [];
+    
+    for (const rec of state.recorrencias.filter(r => r.Ativo)) {
+        const activeRule = state.recorrenciasRegras
+            .filter(regra => Number(regra.RecorrenciaId) === Number(rec.id))
+            .filter(regra => (regra.AnoInicio < state.currentYear) || (regra.AnoInicio === state.currentYear && regra.MesInicio <= state.currentMonth))
+            .sort((a, b) => (a.AnoInicio !== b.AnoInicio ? b.AnoInicio - a.AnoInicio : b.MesInicio - a.MesInicio))[0];
+
+        if (activeRule && !activeRule.CartaoId) { // Only for account recurrences
+            const expectedDate = new Date(state.currentYear, state.currentMonth - 1, activeRule.DiaVencimento);
+            
+            // If the date has arrived or passed, check if a transaction for this recurrence already exists in this month
+            if (expectedDate <= today) {
+                const identifier = `REC:${rec.id}:${state.currentMonth}:${state.currentYear}`;
+                const exists = state.transacoes.some(t => t.Descricao.includes(identifier));
+                
+                if (!exists) {
+                    actions.push(['AddRecord', 'Transacoes', null, {
+                        Descricao: `${rec.Nome} [${identifier}]`,
+                        Valor: activeRule.Valor,
+                        Data: expectedDate.toISOString().split('T')[0],
+                        ContaId: activeRule.ContaId,
+                        CategoriaId: rec.CategoriaId,
+                        Tipo: rec.Tipo,
+                        Status: 'Pendente' // Recurrence starts as Pending
+                    }]);
+                }
+            }
+        }
+    }
+    
+    if (actions.length > 0) {
+        updateStatus('Gerando recorrências...');
+        await grist.docApi.applyUserActions(actions);
+        // Re-fetch transactions to include the new ones
+        state.transacoes = await tableLens.fetchTableRecords('Transacoes');
     }
 }
 
@@ -121,6 +179,51 @@ if (boletosFilter) {
     boletosFilter.addEventListener('change', renderBoletos);
 }
 
+// --- HELPERS FOR GROUPS ---
+
+/**
+ * Helper to generate hierarchical category selection HTML (Group -> Category)
+ */
+function generateCategoryPickerHtml(prefix, currentCatId) {
+    const currentCat = state.categorias.find(c => Number(c.id) === Number(currentCatId));
+    const currentGroupId = currentCat ? currentCat.GrupoRef : '';
+
+    return `
+        <div class="form-row">
+            <div class="form-group" style="flex:1;">
+                <label>Grupo</label>
+                <select id="${prefix}-grupo" onchange="filterCategoryByGroup('${prefix}')">
+                    <option value="">-- Todos --</option>
+                    ${state.grupoCategorias.map(g => `<option value="${g.id}" ${Number(g.id) === Number(currentGroupId) ? 'selected' : ''}>${g.Nome}</option>`).join('')}
+                </select>
+            </div>
+            <div class="form-group" style="flex:1;">
+                <label>Categoria</label>
+                <select id="${prefix}-cat">
+                    <option value="">-- Selecione --</option>
+                    ${state.categorias
+                        .filter(c => !currentGroupId || Number(c.GrupoRef) === Number(currentGroupId))
+                        .map(c => `<option value="${c.id}" ${Number(c.id) === Number(currentCatId) ? 'selected' : ''}>${c.Nome}</option>`).join('')}
+                </select>
+            </div>
+        </div>
+    `;
+}
+
+window.filterCategoryByGroup = function(prefix) {
+    const groupId = document.getElementById(`${prefix}-grupo`).value;
+    const catSelect = document.getElementById(`${prefix}-cat`);
+    const currentVal = catSelect.value;
+    
+    let filtered = state.categorias;
+    if (groupId) {
+        filtered = state.categorias.filter(c => Number(c.GrupoRef) === Number(groupId));
+    }
+    
+    catSelect.innerHTML = '<option value="">-- Selecione --</option>' + 
+        filtered.map(c => `<option value="${c.id}" ${c.id == currentVal ? 'selected' : ''}>${c.Nome}</option>`).join('');
+};
+
 // --- RENDERERS ---
 
 function renderPrediction(startingBalance) {
@@ -129,9 +232,9 @@ function renderPrediction(startingBalance) {
     listEl.innerHTML = '';
     
     state.predictionDetails = [];
+    state.fullTimeline = []; // Raw events for chart
     let runningBalance = startingBalance;
     const monthsNames = ['Janeiro', 'Fevereiro', 'Março', 'Abril', 'Maio', 'Junho', 'Julho', 'Agosto', 'Setembro', 'Outubro', 'Novembro', 'Dezembro'];
-    const timeline = [];
     
     // We start from -1 to capture credit card expenses from the previous month 
     // that will impact the balance in the current month.
@@ -149,11 +252,16 @@ function renderPrediction(startingBalance) {
                 .sort((a, b) => (a.AnoInicio !== b.AnoInicio ? b.AnoInicio - a.AnoInicio : b.MesInicio - a.MesInicio))[0];
 
             if (activeRule) {
+                // If a transaction for this recurrence already exists in this month, don't project it
+                const identifier = `REC:${recorrencia.id}:${m}:${y}`;
+                if (state.transacoes.some(t => t.Descricao.includes(identifier))) return;
+
                 const event = { 
                     descricao: recorrencia.Nome, 
                     valor: recorrencia.Tipo === 'Entrada' ? activeRule.Valor : -activeRule.Valor, 
                     dia: activeRule.DiaVencimento, 
-                    cartaoId: activeRule.CartaoId 
+                    cartaoId: activeRule.CartaoId,
+                    date: new Date(y, m - 1, activeRule.DiaVencimento)
                 };
                 
                 if (event.cartaoId) {
@@ -171,11 +279,12 @@ function renderPrediction(startingBalance) {
                         let payY = billY;
                         if (payM > 12) { payM = 1; payY++; }
                         
-                        timeline.push({ ...event, dia: card.DiaVencimento, targetMonth: payM, targetYear: payY, shifted: true });
+                        state.fullTimeline.push({ ...event, dia: card.DiaVencimento, targetMonth: payM, targetYear: payY, date: new Date(payY, payM - 1, card.DiaVencimento), shifted: true });
                     }
                 } else if (i >= 0) { 
                     // Direct account expenses only appear in the month they occur
                     monthEvents.push(event); 
+                    state.fullTimeline.push(event);
                 }
             }
         });
@@ -183,7 +292,9 @@ function renderPrediction(startingBalance) {
         state.boletos.filter(b => !b.Pago).forEach(b => {
             const bDate = parseDate(b.DataVencimento);
             if (bDate.getMonth() + 1 === m && bDate.getFullYear() === y && i >= 0) {
-                monthEvents.push({ descricao: b.Descricao, valor: -b.Valor, dia: bDate.getDate() });
+                const event = { descricao: b.Descricao, valor: -b.Valor, dia: bDate.getDate(), date: bDate };
+                monthEvents.push(event);
+                state.fullTimeline.push(event);
             }
         });
 
@@ -204,12 +315,13 @@ function renderPrediction(startingBalance) {
                 let payY = billY;
                 if (payM > 12) { payM = 1; payY++; }
 
-                timeline.push({ 
+                state.fullTimeline.push({ 
                     descricao: `${parc.Descricao} (${mDiff + 1}/${parc.NumeroParcelas})`, 
                     valor: -(parc.ValorTotal / parc.NumeroParcelas), 
                     dia: card.DiaVencimento, 
                     targetMonth: payM, 
                     targetYear: payY, 
+                    date: new Date(payY, payM - 1, card.DiaVencimento),
                     shifted: true 
                 });
             }
@@ -217,7 +329,7 @@ function renderPrediction(startingBalance) {
 
         // Only render and calculate balance for current and future months
         if (i >= 0) {
-            const incoming = timeline.filter(e => e.targetMonth === m && e.targetYear === y && e.shifted);
+            const incoming = state.fullTimeline.filter(e => e.targetMonth === m && e.targetYear === y && e.shifted);
             const finalEvents = [...monthEvents, ...incoming].sort((a, b) => a.dia - b.dia);
             const impact = finalEvents.reduce((acc, e) => acc + (e.valor || 0), 0);
             runningBalance += impact;
@@ -238,6 +350,9 @@ function renderPrediction(startingBalance) {
             listEl.appendChild(row);
         }
     }
+    
+    state.chartStartingBalance = startingBalance;
+    window.updateChart();
 }
 
 function renderTransactions() {
@@ -246,8 +361,24 @@ function renderTransactions() {
     const sorted = [...state.transacoes].sort((a, b) => parseDate(b.Data) - parseDate(a.Data)).slice(0, 50);
     listEl.innerHTML = sorted.map(t => {
         const cat = state.categorias.find(c => c.id === t.CategoriaId);
+        const grupo = cat ? state.grupoCategorias.find(g => g.id === cat.GrupoRef) : null;
         const conta = state.contas.find(c => c.id === t.ContaId);
-        return `<div class="month-row clickable-row" onclick="openTransactionModal(${t.id})"><div style="display:flex;flex-direction:column;"><span style="font-weight:bold;">${t.Descricao}</span><small>${parseDate(t.Data).toLocaleDateString('pt-BR')} | ${cat ? cat.Nome : '-'} | ${conta ? conta.Nome : '-'}</small></div><span class="${t.Tipo === 'Entrada' ? 'positive' : 'negative'}">${formatCurrency(t.Valor)}</span></div>`
+        
+        const isRecurrence = t.Descricao.includes('REC:');
+        const isConfirmed = t.Status === 'Confirmado';
+        
+        let rowClass = 'month-row clickable-row';
+        if (isRecurrence) {
+            rowClass += isConfirmed ? ' trans-confirmed-recorrencia' : ' trans-pending-recorrencia';
+        }
+
+        return `<div class="${rowClass}" onclick="openTransactionModal(${t.id})">
+            <div style="display:flex;flex-direction:column;">
+                <span style="font-weight:bold;">${t.Descricao.split(' [REC:')[0]}</span>
+                <small>${parseDate(t.Data).toLocaleDateString('pt-BR')} | ${grupo ? `${grupo.Nome} > ` : ''}${cat ? cat.Nome : '-'} | ${conta ? conta.Nome : '-'}</small>
+            </div>
+            <span class="${t.Tipo === 'Entrada' ? 'positive' : 'negative'}">${formatCurrency(t.Valor)}</span>
+        </div>`
     }).join('') || '<p>Nenhuma transação encontrada.</p>';
 }
 
@@ -373,14 +504,27 @@ window.openBoletoInstallmentModal = function() {
 function renderRecurring() {
     const listEl = document.getElementById('recurring-list');
     if (!listEl) return;
-    const catFilter = document.getElementById('filter-recurring-category');
-    if (catFilter && catFilter.options.length <= 1) catFilter.innerHTML = '<option value="">Categoria (Todas)</option>' + state.categorias.map(c => `<option value="${c.id}">${c.Nome}</option>`).join('');
+    
+    const groupFilter = document.getElementById('filter-recurring-group');
+    if (groupFilter && groupFilter.options.length <= 1) {
+        groupFilter.innerHTML = '<option value="">Grupo (Todos)</option>' + state.grupoCategorias.map(g => `<option value="${g.id}">${g.Nome}</option>`).join('');
+        groupFilter.addEventListener('change', renderRecurring);
+    }
+    
     const tF = document.getElementById('filter-recurring-type').value;
-    const cF = document.getElementById('filter-recurring-category').value;
-    const filtered = state.recorrencias.filter(r => (!tF || r.Tipo === tF) && (!cF || Number(r.CategoriaId) === Number(cF)));
+    const gF = groupFilter ? groupFilter.value : '';
+    
+    const filtered = state.recorrencias.filter(r => {
+        const cat = state.categorias.find(c => c.id === r.CategoriaId);
+        const matchesType = !tF || r.Tipo === tF;
+        const matchesGroup = !gF || (cat && Number(cat.GrupoRef) === Number(gF));
+        return matchesType && matchesGroup;
+    });
+
     listEl.innerHTML = filtered.map(r => {
         const cat = state.categorias.find(c => c.id === r.CategoriaId);
-        return `<div class="month-row clickable-row" onclick="openRecurringModal(${r.id})"><span>${r.Nome} ${cat ? `<small>(${cat.Nome})</small>` : ''}</span><span>${r.Ativo ? '✅' : '❌'}</span></div>`
+        const grupo = cat ? state.grupoCategorias.find(g => g.id === cat.GrupoRef) : null;
+        return `<div class="month-row clickable-row" onclick="openRecurringModal(${r.id})"><span>${r.Nome} ${cat ? `<small>(${grupo ? `${grupo.Nome} > ` : ''}${cat.Nome})</small>` : ''}</span><span>${r.Ativo ? '✅' : '❌'}</span></div>`
     }).join('') || '<p>Nenhum item encontrado.</p>';
 }
 
@@ -396,9 +540,19 @@ function renderCardsAndInstallments() {
 function renderSettings() {
     const accEl = document.getElementById('accounts-list');
     const catEl = document.getElementById('categories-list');
+    const groupEl = document.getElementById('groups-list');
     if (!accEl || !catEl) return;
+    
     accEl.innerHTML = state.contas.map(c => `<div class="month-row clickable-row" style="padding:0.5rem;" onclick="openAccountModal(${c.id})"><span>${c.Nome}</span><small>${formatCurrency(c.SaldoAtual)}</small></div>`).join('');
-    catEl.innerHTML = state.categorias.map(c => `<div class="month-row clickable-row" style="padding:0.5rem;" onclick="openCategoryModal(${c.id})"><span>${c.Nome}</span><small>${c.TipoPadrao}</small></div>`).join('');
+    
+    catEl.innerHTML = state.categorias.map(c => {
+        const g = state.grupoCategorias.find(grp => grp.id === c.GrupoRef);
+        return `<div class="month-row clickable-row" style="padding:0.5rem;" onclick="openCategoryModal(${c.id})"><span>${g ? `${g.Nome} > ` : ''}${c.Nome}</span><small>${c.TipoPadrao}</small></div>`;
+    }).join('');
+
+    if (groupEl) {
+        groupEl.innerHTML = state.grupoCategorias.map(g => `<div class="month-row clickable-row" style="padding:0.5rem;" onclick="openGroupModal(${g.id})"><span>${g.Nome}</span></div>`).join('');
+    }
 }
 
 // --- MODALS ---
@@ -410,8 +564,13 @@ window.openRecurringModal = function(id) {
     document.getElementById('edit-item-nome').value = item.Nome;
     document.getElementById('edit-item-tipo').value = item.Tipo;
     document.getElementById('edit-item-ativo').checked = item.Ativo;
-    const catSelect = document.getElementById('edit-item-categoria');
-    catSelect.innerHTML = state.categorias.map(c => `<option value="${c.id}" ${Number(c.id) === Number(item.CategoriaId) ? 'selected' : ''}>${c.Nome}</option>`).join('');
+    
+    // Replace old category select with group picker
+    const pickerContainer = document.getElementById('edit-item-category-container');
+    if (pickerContainer) {
+        pickerContainer.innerHTML = generateCategoryPickerHtml('rec', item.CategoriaId);
+    }
+
     document.getElementById('new-rule-conta').innerHTML = '<option value="">-- Conta --</option>' + state.contas.map(c => `<option value="${c.id}">${c.Nome}</option>`).join('');
     document.getElementById('new-rule-cartao').innerHTML = '<option value="">-- Cartão --</option>' + state.cartoes.map(c => `<option value="${c.id}">${c.Nome}</option>`).join('');
     document.getElementById('rules-section').style.display = id ? 'block' : 'none';
@@ -454,7 +613,12 @@ function resetRuleForm() {
 document.getElementById('cancel-rule-edit-btn').onclick = resetRuleForm;
 
 document.getElementById('save-item-btn').onclick = async () => {
-    const data = { Nome: document.getElementById('edit-item-nome').value, Tipo: document.getElementById('edit-item-tipo').value, CategoriaId: parseInt(document.getElementById('edit-item-categoria').value), Ativo: document.getElementById('edit-item-ativo').checked };
+    const data = { 
+        Nome: document.getElementById('edit-item-nome').value, 
+        Tipo: document.getElementById('edit-item-tipo').value, 
+        CategoriaId: parseInt(document.getElementById('rec-cat').value) || null, 
+        Ativo: document.getElementById('edit-item-ativo').checked 
+    };
     await saveToGrist('Recorrencias', selectedItemId, data);
 };
 
@@ -470,9 +634,25 @@ window.deleteRule = async function(id) { if (confirm('Excluir?')) await grist.do
 
 window.openTransactionModal = function(id) {
     const t = id ? state.transacoes.find(x => x.id === id) : { Descricao: '', Valor: 0, Tipo: 'Saída', Status: 'Pendente', Data: new Date().toISOString().split('T')[0] };
-    const body = `<div class="modal-body-form"><div class="form-group"><label>Descrição</label><input type="text" id="t-desc" value="${t.Descricao}"></div><div class="form-row"><div class="form-group" style="flex:1;"><label>Valor</label><input type="number" id="t-val" value="${t.Valor}"></div><div class="form-group" style="flex:1;"><label>Data</label><input type="date" id="t-data" value="${new Date(t.Data).toISOString().split('T')[0]}"></div></div><div class="form-row"><div class="form-group" style="flex:1;"><label>Conta</label><select id="t-conta">${state.contas.map(c => `<option value="${c.id}" ${c.id === t.ContaId ? 'selected' : ''}>${c.Nome}</option>`).join('')}</select></div><div class="form-group" style="flex:1;"><label>Categoria</label><select id="t-cat">${state.categorias.map(c => `<option value="${c.id}" ${c.id === t.CategoriaId ? 'selected' : ''}>${c.Nome}</option>`).join('')}</select></div></div></div>`;
+    const body = `<div class="modal-body-form">
+        <div class="form-group"><label>Descrição</label><input type="text" id="t-desc" value="${t.Descricao}"></div>
+        <div class="form-row">
+            <div class="form-group" style="flex:1;"><label>Valor</label><input type="number" id="t-val" value="${t.Valor}"></div>
+            <div class="form-group" style="flex:1;"><label>Data</label><input type="date" id="t-data" value="${new Date(t.Data).toISOString().split('T')[0]}"></div>
+        </div>
+        <div class="form-group"><label>Conta</label><select id="t-conta">${state.contas.map(c => `<option value="${c.id}" ${c.id === t.ContaId ? 'selected' : ''}>${c.Nome}</option>`).join('')}</select></div>
+        ${generateCategoryPickerHtml('trans', t.CategoriaId)}
+    </div>`;
     openGenericModal(id ? 'Editar Transação' : 'Nova Transação', body, async () => {
-        await saveToGrist('Transacoes', id, { Descricao: document.getElementById('t-desc').value, Valor: parseFloat(document.getElementById('t-val').value), Data: document.getElementById('t-data').value, ContaId: parseInt(document.getElementById('t-conta').value), CategoriaId: parseInt(document.getElementById('t-cat').value), Tipo: t.Tipo, Status: t.Status });
+        await saveToGrist('Transacoes', id, { 
+            Descricao: document.getElementById('t-desc').value, 
+            Valor: parseFloat(document.getElementById('t-val').value), 
+            Data: document.getElementById('t-data').value, 
+            ContaId: parseInt(document.getElementById('t-conta').value), 
+            CategoriaId: parseInt(document.getElementById('trans-cat').value) || null, 
+            Tipo: t.Tipo, 
+            Status: t.Status 
+        });
     });
 };
 
@@ -493,18 +673,34 @@ window.openInstallmentModal = function(id, cardId) {
 };
 
 window.openAccountModal = function(id) {
-    const c = id ? state.contas.find(x => x.id === id) : { Nome: '', Tipo: 'Corrente', SaldoInicial: 0, Ativa: true };
-    const body = `<div class="modal-body-form"><div class="form-group"><label>Nome</label><input type="text" id="a-nome" value="${c.Nome}"></div><div class="form-row"><div class="form-group" style="flex:1;"><label>Tipo</label><select id="a-tipo"><option value="Corrente" ${c.Tipo === 'Corrente' ? 'selected' : ''}>Corrente</option><option value="Poupança" ${c.Tipo === 'Poupança' ? 'selected' : ''}>Poupança</option><option value="Carteira" ${c.Tipo === 'Carteira' ? 'selected' : ''}>Carteira</option></select></div><div class="form-group" style="flex:1;"><label>Saldo Inicial</label><input type="number" id="a-saldo" value="${c.SaldoInicial}"></div></div></div>`;
+    const c = id ? state.contas.find(x => x.id === id) : { Nome: '', Tipo: 'Corrente', SaldoInicial: 0, DataSaldoInicial: new Date().toISOString().split('T')[0], Ativa: true };
+    const body = `<div class="modal-body-form"><div class="form-group"><label>Nome</label><input type="text" id="a-nome" value="${c.Nome}"></div><div class="form-row"><div class="form-group" style="flex:1;"><label>Tipo</label><select id="a-tipo"><option value="Corrente" ${c.Tipo === 'Corrente' ? 'selected' : ''}>Corrente</option><option value="Poupança" ${c.Tipo === 'Poupança' ? 'selected' : ''}>Poupança</option><option value="Carteira" ${c.Tipo === 'Carteira' ? 'selected' : ''}>Carteira</option></select></div><div class="form-group" style="flex:1;"><label>Saldo Inicial</label><input type="number" id="a-saldo" value="${c.SaldoInicial}"></div></div><div class="form-group"><label>Data do Saldo Inicial</label><input type="date" id="a-data" value="${parseDate(c.DataSaldoInicial).toISOString().split('T')[0]}"></div></div>`;
     openGenericModal(id ? 'Editar Conta' : 'Nova Conta', body, async () => {
-        await saveToGrist('Contas', id, { Nome: document.getElementById('a-nome').value, Tipo: document.getElementById('a-tipo').value, SaldoInicial: parseFloat(document.getElementById('a-saldo').value), Ativa: true });
+        await saveToGrist('Contas', id, { Nome: document.getElementById('a-nome').value, Tipo: document.getElementById('a-tipo').value, SaldoInicial: parseFloat(document.getElementById('a-saldo').value), DataSaldoInicial: document.getElementById('a-data').value, Ativa: true });
     });
 };
 
 window.openCategoryModal = function(id) {
-    const c = id ? state.categorias.find(x => x.id === id) : { Nome: '', TipoPadrao: 'Saída' };
-    const body = `<div class="modal-body-form"><div class="form-group"><label>Nome</label><input type="text" id="cat-nome" value="${c.Nome}"></div><div class="form-group"><label>Tipo Padrão</label><select id="cat-tipo"><option value="Entrada" ${c.TipoPadrao === 'Entrada' ? 'selected' : ''}>Entrada</option><option value="Saída" ${c.TipoPadrao === 'Saída' ? 'selected' : ''}>Saída</option></select></div></div>`;
+    const c = id ? state.categorias.find(x => x.id === id) : { Nome: '', TipoPadrao: 'Saída', GrupoRef: null };
+    const body = `<div class="modal-body-form">
+        <div class="form-group"><label>Nome</label><input type="text" id="cat-nome" value="${c.Nome}"></div>
+        <div class="form-group"><label>Grupo</label><select id="cat-grupo"><option value="">-- Sem Grupo --</option>${state.grupoCategorias.map(g => `<option value="${g.id}" ${g.id === c.GrupoRef ? 'selected' : ''}>${g.Nome}</option>`).join('')}</select></div>
+        <div class="form-group"><label>Tipo Padrão</label><select id="cat-tipo"><option value="Entrada" ${c.TipoPadrao === 'Entrada' ? 'selected' : ''}>Entrada</option><option value="Saída" ${c.TipoPadrao === 'Saída' ? 'selected' : ''}>Saída</option></select></div>
+    </div>`;
     openGenericModal(id ? 'Editar Categoria' : 'Nova Categoria', body, async () => {
-        await saveToGrist('Categorias', id, { Nome: document.getElementById('cat-nome').value, TipoPadrao: document.getElementById('cat-tipo').value });
+        await saveToGrist('Categorias', id, { 
+            Nome: document.getElementById('cat-nome').value, 
+            GrupoRef: parseInt(document.getElementById('cat-grupo').value) || null,
+            TipoPadrao: document.getElementById('cat-tipo').value 
+        });
+    });
+};
+
+window.openGroupModal = function(id) {
+    const g = id ? state.grupoCategorias.find(x => x.id === id) : { Nome: '' };
+    const body = `<div class="modal-body-form"><div class="form-group"><label>Nome do Grupo</label><input type="text" id="g-nome" value="${g.Nome}"></div></div>`;
+    openGenericModal(id ? 'Editar Grupo' : 'Novo Grupo', body, async () => {
+        await saveToGrist('GrupoCategorias', id, { Nome: document.getElementById('g-nome').value });
     });
 };
 
@@ -542,3 +738,125 @@ document.querySelectorAll('.close-modal').forEach(btn => {
 });
 
 window.onclick = (event) => { if (event.target.className === 'modal') { event.target.style.display = 'none'; if (event.target.id === 'recurring-modal') resetRuleForm(); } };
+
+window.updateChart = function() {
+    const ctx = document.getElementById('cashflow-chart')?.getContext('2d');
+    if (!ctx) return;
+
+    const data = processChartData(state.chartGranularity);
+    
+    if (state.chartInstance) {
+        state.chartInstance.destroy();
+    }
+
+    state.chartInstance = new Chart(ctx, {
+        type: 'bar',
+        data: {
+            labels: data.labels,
+            datasets: [
+                {
+                    label: 'Saldo Acumulado',
+                    data: data.balances,
+                    type: 'line',
+                    borderColor: '#3b82f6',
+                    backgroundColor: 'transparent',
+                    borderWidth: 2,
+                    tension: 0.3,
+                    yAxisID: 'y'
+                },
+                {
+                    label: 'Entradas',
+                    data: data.ins,
+                    backgroundColor: '#2ecc71',
+                    borderRadius: 4,
+                    yAxisID: 'y' // Use the same axis
+                },
+                {
+                    label: 'Saídas',
+                    data: data.outs, // These are now negative
+                    backgroundColor: '#e74c3c',
+                    borderRadius: 4,
+                    yAxisID: 'y' // Use the same axis
+                }
+            ]
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            interaction: { intersect: false, mode: 'index' },
+            scales: {
+                x: { stacked: true },
+                y: { 
+                    type: 'linear', 
+                    display: true, 
+                    position: 'left', 
+                    title: { display: true, text: 'Valor (R$)' },
+                    stacked: true 
+                }
+            },
+            plugins: {
+                legend: { position: 'top', labels: { boxWidth: 12, usePointStyle: true } },
+                tooltip: {
+                    callbacks: {
+                        label: function(context) {
+                            let label = context.dataset.label || '';
+                            if (label) label += ': ';
+                            // For outputs, show absolute value in tooltip for readability
+                            const val = context.dataset.label === 'Saídas' ? Math.abs(context.parsed.y) : context.parsed.y;
+                            if (val !== null) label += formatCurrency(val);
+                            return label;
+                        }
+                    }
+                }
+            }
+        }
+    });
+};
+
+function processChartData(gran) {
+    const start = new Date(state.currentYear, state.currentMonth - 1, 1);
+    const end = new Date(state.currentYear, state.currentMonth + 5, 0); // 6 months
+    const labels = [];
+    const ins = [];
+    const outs = [];
+    const balances = [];
+    let currentBalance = state.chartStartingBalance;
+
+    if (gran === 'daily') {
+        for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
+            const dayEvents = state.fullTimeline ? state.fullTimeline.filter(e => e.date && e.date.toDateString() === d.toDateString()) : [];
+            const dayIn = dayEvents.filter(e => e.valor > 0).reduce((acc, e) => acc + e.valor, 0);
+            const dayOut = dayEvents.filter(e => e.valor < 0).reduce((acc, e) => acc + Math.abs(e.valor), 0);
+            currentBalance += (dayIn - dayOut);
+            
+            labels.push(d.toLocaleDateString('pt-BR', { day: '2-digit', month: '2-digit' }));
+            ins.push(dayIn);
+            outs.push(-dayOut); // Make output negative for the chart
+            balances.push(currentBalance);
+        }
+    } else if (gran === 'weekly') {
+        for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 7)) {
+            const weekEnd = new Date(d); weekEnd.setDate(d.getDate() + 6);
+            const weekEvents = state.fullTimeline ? state.fullTimeline.filter(e => e.date && e.date >= d && e.date <= weekEnd) : [];
+            const weekIn = weekEvents.filter(e => e.valor > 0).reduce((acc, e) => acc + e.valor, 0);
+            const weekOut = weekEvents.filter(e => e.valor < 0).reduce((acc, e) => acc + Math.abs(e.valor), 0);
+            currentBalance += (weekIn - weekOut);
+
+            labels.push(`Sem. ${d.toLocaleDateString('pt-BR', { day: '2-digit', month: '2-digit' })}`);
+            ins.push(weekIn);
+            outs.push(-weekOut); // Make output negative for the chart
+            balances.push(currentBalance);
+        }
+    } else if (gran === 'monthly') {
+        if(state.predictionDetails) {
+            state.predictionDetails.forEach(m => {
+                labels.push(m.monthName);
+                ins.push(m.totalIn);
+                outs.push(-m.totalOut); // Make output negative for the chart
+                balances.push(m.balance);
+            });
+        }
+    }
+
+    return { labels, ins, outs, balances };
+}
